@@ -10,18 +10,51 @@ export default function TeacherDashboard() {
   const [stats, setStats] = useState({ present: 0, late: 0, absent: 45 });
   const [isLoading, setIsLoading] = useState(true);
 
-  // 1. Fetch our dummy class/teacher on load
+  // 1. Fetch class context AND check for an existing active session
   useEffect(() => {
-    async function fetchTestContext() {
-      const { data, error } = await supabase.from('classes').select('id, teacher_id').limit(1).single();
-      if (data) {
-        setTestContext({ classId: data.id, teacherId: data.teacher_id });
+    async function initializeDashboard() {
+      const { data: classData, error: classError } = await supabase
+        .from('classes')
+        .select('id, teacher_id')
+        .limit(1)
+        .single();
+
+      if (classData) {
+        setTestContext({ classId: classData.id, teacherId: classData.teacher_id });
+
+        // RECOVERY LOGIC: Check if a session was left running
+        const { data: existingSession } = await supabase
+          .from('attendance_sessions')
+          .select('*')
+          .eq('class_id', classData.id)
+          .eq('is_active', true)
+          .maybeSingle();
+
+        if (existingSession) {
+          setActiveSession(existingSession);
+          
+          // Count historical scans from before the refresh
+          const { data: logs } = await supabase
+            .from('attendance_logs')
+            .select('status')
+            .eq('session_id', existingSession.id);
+
+          if (logs) {
+            const presentCount = logs.filter(l => l.status === 'PRESENT').length;
+            const lateCount = logs.filter(l => l.status === 'LATE').length;
+            setStats({
+              present: presentCount,
+              late: lateCount,
+              absent: 45 - presentCount - lateCount
+            });
+          }
+        }
       } else {
-        console.error("No test class found. Did you run the SQL seed script?", error);
+        console.error("No test class found.", classError);
       }
       setIsLoading(false);
     }
-    fetchTestContext();
+    initializeDashboard();
   }, []);
 
   // 2. Generate and OVERWRITE the secure QR Token in Postgres
@@ -30,7 +63,6 @@ export default function TeacherDashboard() {
     const nonce = Math.random().toString(36).substring(2, 10);
     const payload = `ATT-${timestamp}-${nonce}`;
     
-    // Set expiry 30 seconds from now
     const expiresAt = new Date(timestamp + 30000).toISOString();
 
     const { error } = await supabase.from('qr_tokens').upsert([
@@ -45,10 +77,9 @@ export default function TeacherDashboard() {
     }
   }, []);
 
-  // 3. Start or End the Session in Postgres
+  // 3. Start or End the Session
   const toggleSession = async () => {
     if (!activeSession) {
-      // START SESSION
       const lateTime = new Date();
       lateTime.setMinutes(lateTime.getMinutes() + 5);
 
@@ -69,7 +100,6 @@ export default function TeacherDashboard() {
         console.error("Failed to start session:", error);
       }
     } else {
-      // END SESSION
       await supabase.from('attendance_sessions')
         .update({ is_active: false, end_time: new Date().toISOString() })
         .eq('id', activeSession.id);
@@ -84,6 +114,11 @@ export default function TeacherDashboard() {
   useEffect(() => {
     let timerInterval;
     if (activeSession) {
+      // Immediately generate a token if we just recovered the session on refresh
+      if (currentQrPayload === 'WAITING_FOR_SESSION') {
+        generateAndSaveToken(activeSession.id);
+      }
+
       timerInterval = setInterval(() => {
         setCountdown((prev) => {
           if (prev <= 1) {
@@ -95,7 +130,7 @@ export default function TeacherDashboard() {
       }, 1000);
     }
     return () => clearInterval(timerInterval);
-  }, [activeSession, generateAndSaveToken]);
+  }, [activeSession, generateAndSaveToken, currentQrPayload]);
 
   // 5. Supabase Realtime WebSockets for Live Stats
   useEffect(() => {
@@ -106,7 +141,6 @@ export default function TeacherDashboard() {
         'postgres_changes',
         { event: 'INSERT', schema: 'public', table: 'attendance_logs', filter: `session_id=eq.${activeSession.id}` },
         (payload) => {
-          console.log('New scan received!', payload);
           setStats((prev) => {
             const newStats = { ...prev };
             if (payload.new.status === 'PRESENT') newStats.present += 1;
