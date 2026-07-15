@@ -24,6 +24,30 @@ export default function StudentPortal() {
   const [scanStatus, setScanStatus] = useState('idle');
   const [statusMessage, setStatusMessage] = useState('Ready to Scan');
 
+  // --- SECURITY PATCH 1: Validate Token on Page Load ---
+  // If they open an old browser (like Chrome) after linking a new one (like Safari),
+  // this immediately kicks them out before they can even try to scan.
+  useEffect(() => {
+    async function verifyDeviceIntegrity() {
+      if (!studentContext) return;
+
+      const currentToken = getDeviceToken();
+      const { data: deviceData } = await supabase
+        .from('devices')
+        .select('device_fingerprint')
+        .eq('user_id', studentContext.userId)
+        .maybeSingle();
+
+      // If no device is found (unlinked) or the token doesn't match this browser
+      if (!deviceData || deviceData.device_fingerprint !== currentToken) {
+        localStorage.removeItem('student_context');
+        setStudentContext(null);
+        alert('SECURITY NOTICE: Your session is invalid or this device was unlinked. Please log in again.');
+      }
+    }
+    verifyDeviceIntegrity();
+  }, [studentContext]);
+
   const handleLogin = async (e) => {
     e.preventDefault();
     setLoginError('');
@@ -52,7 +76,7 @@ export default function StudentPortal() {
 
       if (deviceData) {
         if (deviceData.device_fingerprint !== deviceToken) {
-          setLoginError('SECURITY ALERT: This Student ID is locked to another device.');
+          setLoginError('SECURITY ALERT: This Student ID is already locked to another phone/browser. Ask your teacher to unlink it first.');
           setIsLoggingIn(false);
           return;
         }
@@ -70,6 +94,7 @@ export default function StudentPortal() {
 
       const context = {
         id: studentData.id,
+        userId: studentData.user_id, // Important: We now save userId to verify against the devices table later
         firstName: studentData.users.first_name,
         lastName: studentData.users.last_name,
         studentId: studentIdInput.trim()
@@ -89,9 +114,25 @@ export default function StudentPortal() {
     if (scanStatus === 'scanning' || scanStatus === 'success') return;
     
     setScanStatus('scanning');
-    setStatusMessage('Validating Cryptographic Token...');
+    setStatusMessage('Validating Device & Token...');
 
     try {
+      // --- SECURITY PATCH 2: Validate Token Exactly at Scan Time ---
+      // Prevents race conditions if they keep the tab open in the background
+      const currentToken = getDeviceToken();
+      const { data: deviceData } = await supabase
+        .from('devices')
+        .select('device_fingerprint')
+        .eq('user_id', studentContext.userId)
+        .maybeSingle();
+
+      if (!deviceData || deviceData.device_fingerprint !== currentToken) {
+        localStorage.removeItem('student_context');
+        setStudentContext(null);
+        throw new Error('ACCESS REVOKED: Device mismatch. You have been logged out.');
+      }
+      // -------------------------------------------------------------
+
       const { data: tokenData, error: tokenError } = await supabase
         .from('qr_tokens')
         .select('*, session:attendance_sessions(*)')
@@ -111,8 +152,7 @@ export default function StudentPortal() {
       if (now < sessionStart) throw new Error('This session has not started yet.');
       if (now > sessionEnd) throw new Error('This session has concluded.');
 
-      // --- SECURITY PATCH: Just-In-Time Enrollment Verification ---
-      // We must prove the student is currently enrolled in the class tied to this QR code.
+      // Verify Enrollment
       const { data: enrollmentData, error: enrollmentError } = await supabase
         .from('enrollments')
         .select('id')
@@ -121,13 +161,10 @@ export default function StudentPortal() {
         .maybeSingle();
 
       if (!enrollmentData || enrollmentError) {
-        // Self-Destruct the local session
         localStorage.removeItem('student_context');
-        localStorage.removeItem('secure_device_token'); // Forces a completely new hardware bind next time
         setStudentContext(null);
-        throw new Error('ACCESS REVOKED: You are no longer enrolled in this class. You have been logged out.');
+        throw new Error('ACCESS REVOKED: You are no longer enrolled in this class. Logged out.');
       }
-      // -----------------------------------------------------------
 
       const finalStatus = now > lateThreshold ? 'LATE' : 'PRESENT';
 

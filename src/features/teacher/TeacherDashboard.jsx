@@ -5,7 +5,7 @@ import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 
 export default function TeacherDashboard() {
-  const [activeTab, setActiveTab] = useState('qr');
+  const [activeTab, setActiveTab] = useState('qr'); // 'qr', 'roster', 'setup', 'history'
   const [teacherContext, setTeacherContext] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
 
@@ -28,22 +28,39 @@ export default function TeacherDashboard() {
   const [attendanceLogs, setAttendanceLogs] = useState({});
   const [stats, setStats] = useState({ present: 0, late: 0, notScanned: 0, total: 0 });
 
-  const [scheduling, setScheduling] = useState({ startTime: '', lateTime: '', endTime: '' });
+  // Custom session scheduling inputs
+  const [scheduling, setScheduling] = useState({
+    startTime: '',
+    lateTime: '',
+    endTime: ''
+  });
 
+  // Use a ref to keep track of enrolled students for the auto-end timer hook
   const enrolledStudentsRef = useRef([]);
-  useEffect(() => { enrolledStudentsRef.current = enrolledStudents; }, [enrolledStudents]);
+  useEffect(() => {
+    enrolledStudentsRef.current = enrolledStudents;
+  }, [enrolledStudents]);
 
+  // Use a ref for the active session to avoid stale state in interval functions
   const activeSessionRef = useRef(null);
-  useEffect(() => { activeSessionRef.current = activeSession; }, [activeSession]);
+  useEffect(() => {
+    activeSessionRef.current = activeSession;
+  }, [activeSession]);
 
+  // Helper: Get default times for the input boxes (HH:MM format)
   const getFormattedTime = (offsetMinutes = 0) => {
     const d = new Date();
     d.setMinutes(d.getMinutes() + offsetMinutes);
     return d.toTimeString().split(' ')[0].substring(0, 5);
   };
 
+  // Populate default times on component load
   useEffect(() => {
-    setScheduling({ startTime: getFormattedTime(0), lateTime: getFormattedTime(10), endTime: getFormattedTime(30) });
+    setScheduling({
+      startTime: getFormattedTime(0),
+      lateTime: getFormattedTime(10), // Default late threshold: 10 minutes from now
+      endTime: getFormattedTime(30)   // Default end time: 30 minutes from now
+    });
   }, []);
 
   // 1. Initialize Teacher
@@ -70,15 +87,15 @@ export default function TeacherDashboard() {
     }
   };
 
-  // 2. Load Class Data
+  // 2. Load Class Data (Roster, Active Session, Past Sessions)
   useEffect(() => {
     if (!selectedClassId) return;
 
     async function loadClassData() {
-      // NOTE: We now fetch user_id so we can target the devices table for unlinking
+      // Updated select query to nestedly fetch linked device IDs
       const { data: roster } = await supabase
         .from('enrollments')
-        .select('id, student_id, students(id, user_id, student_id_number, users(first_name, last_name))')
+        .select('id, student_id, students(id, user_id, student_id_number, users(first_name, last_name, devices(id)))')
         .eq('class_id', selectedClassId);
       
       let currentRoster = [];
@@ -87,10 +104,20 @@ export default function TeacherDashboard() {
         setEnrolledStudents(currentRoster);
       }
 
-      const { data: history } = await supabase.from('attendance_sessions').select('*').eq('class_id', selectedClassId).eq('is_active', false).order('start_time', { ascending: false });
+      const { data: history } = await supabase
+        .from('attendance_sessions')
+        .select('*')
+        .eq('class_id', selectedClassId)
+        .eq('is_active', false)
+        .order('start_time', { ascending: false });
       if (history) setPastSessions(history);
 
-      const { data: session } = await supabase.from('attendance_sessions').select('*').eq('class_id', selectedClassId).eq('is_active', true).maybeSingle();
+      const { data: session } = await supabase
+        .from('attendance_sessions')
+        .select('*')
+        .eq('class_id', selectedClassId)
+        .eq('is_active', true)
+        .maybeSingle();
 
       if (session) {
         setActiveSession(session);
@@ -116,7 +143,23 @@ export default function TeacherDashboard() {
     loadClassData();
   }, [selectedClassId]);
 
-  // 3. Roster Actions (Register, Remove, UNLINK, OVERRIDE)
+  // 3. Class Management & Registration
+  const handleCreateSubject = async (e) => {
+    e.preventDefault();
+    setSetupMessage('Creating...');
+    const { error } = await supabase.from('subjects').insert({ name: subjectForm.name, code: subjectForm.code, teacher_id: teacherContext.id });
+    if (!error) { setSubjectForm({ name: '', code: '' }); fetchSubjectsAndClasses(teacherContext.id); setSetupMessage('Success.'); }
+    setTimeout(() => setSetupMessage(''), 3000);
+  };
+
+  const handleCreateClass = async (e) => {
+    e.preventDefault();
+    setSetupMessage('Creating...');
+    const { error } = await supabase.from('classes').insert({ subject_id: classForm.subjectId, section_name: classForm.sectionName, teacher_id: teacherContext.id });
+    if (!error) { setClassForm({ subjectId: '', sectionName: '' }); fetchSubjectsAndClasses(teacherContext.id); setSetupMessage('Success.'); }
+    setTimeout(() => setSetupMessage(''), 3000);
+  };
+
   const handleRegisterStudent = async (e) => {
     e.preventDefault();
     if (!selectedClassId) return setRegStatus('Please select a class first.');
@@ -134,7 +177,20 @@ export default function TeacherDashboard() {
 
       setRegStatus('Success.');
       setRegForm({ firstName: '', lastName: '', studentId: '' });
-      const newStudent = { id: 'temp', student_id: studentData.id, students: { id: studentData.id, user_id: userData.id, student_id_number: regForm.studentId, users: { first_name: regForm.firstName, last_name: regForm.lastName } } };
+      const newStudent = { 
+        id: 'temp', 
+        student_id: studentData.id, 
+        students: { 
+          id: studentData.id,
+          user_id: userData.id,
+          student_id_number: regForm.studentId, 
+          users: { 
+            first_name: regForm.firstName, 
+            last_name: regForm.lastName,
+            devices: [] // No device registered initially
+          } 
+        } 
+      };
       setEnrolledStudents(prev => [...prev, newStudent]);
       setStats(prev => ({ ...prev, total: prev.total + 1, notScanned: prev.notScanned + 1 }));
     } catch (err) {
@@ -152,7 +208,7 @@ export default function TeacherDashboard() {
     }
   };
 
-  // NEW: Hardware Device Unlinking
+  // Hardware Device Unlinking
   const handleUnlinkDevice = async (userId, studentName) => {
     if (!window.confirm(`Are you sure you want to unlink the device for ${studentName}? This allows them to log in on a new phone.`)) return;
     
@@ -161,10 +217,26 @@ export default function TeacherDashboard() {
       alert("Failed to unlink device.");
     } else {
       alert(`${studentName}'s device has been unlinked successfully.`);
+      // Optimistically clear device state locally so button hides immediately
+      setEnrolledStudents(prev => prev.map(enrollment => {
+        if (enrollment.students.user_id === userId) {
+          return {
+            ...enrollment,
+            students: {
+              ...enrollment.students,
+              users: {
+                ...enrollment.students.users,
+                devices: [] // Set to empty to hide button
+              }
+            }
+          };
+        }
+        return enrollment;
+      }));
     }
   };
 
-  // NEW: Manual Attendance Override
+  // Manual Attendance Override Dropdown handler
   const handleStatusOverride = async (studentId, newStatus) => {
     if (!activeSession) return;
     
@@ -187,15 +259,13 @@ export default function TeacherDashboard() {
       return newStats;
     });
 
-    // 2. Database Upsert (Insert or Update if exists)
+    // 2. Database Action
     if (newStatus === 'NOT SCANNED') {
-      // If they revert to Not Scanned, we delete the log entirely to reset it
       await supabase.from('attendance_logs')
         .delete()
         .eq('session_id', activeSession.id)
         .eq('student_id', studentId);
     } else {
-      // Otherwise we upsert the override status
       await supabase.from('attendance_logs').upsert({
         session_id: activeSession.id,
         student_id: studentId,
@@ -205,24 +275,7 @@ export default function TeacherDashboard() {
     }
   };
 
-  // 4. Class Setup Forms
-  const handleCreateSubject = async (e) => {
-    e.preventDefault();
-    setSetupMessage('Creating...');
-    const { error } = await supabase.from('subjects').insert({ name: subjectForm.name, code: subjectForm.code, teacher_id: teacherContext.id });
-    if (!error) { setSubjectForm({ name: '', code: '' }); fetchSubjectsAndClasses(teacherContext.id); setSetupMessage('Success.'); }
-    setTimeout(() => setSetupMessage(''), 3000);
-  };
-
-  const handleCreateClass = async (e) => {
-    e.preventDefault();
-    setSetupMessage('Creating...');
-    const { error } = await supabase.from('classes').insert({ subject_id: classForm.subjectId, section_name: classForm.sectionName, teacher_id: teacherContext.id });
-    if (!error) { setClassForm({ subjectId: '', sectionName: '' }); fetchSubjectsAndClasses(teacherContext.id); setSetupMessage('Success.'); }
-    setTimeout(() => setSetupMessage(''), 3000);
-  };
-
-  // 5. Session Controls & Timers
+  // 4. Session Controls, QR Generation & Auto-End Timer
   const generateAndSaveToken = useCallback(async (sessionId) => {
     const timestamp = Date.now();
     const nonce = Math.random().toString(36).substring(2, 10);
@@ -252,18 +305,27 @@ export default function TeacherDashboard() {
 
   const closeActiveSession = useCallback(async (sessionId, rosterList) => {
     const currentLogs = { ...attendanceLogs };
-    const { data: latestLogs } = await supabase.from('attendance_logs').select('student_id, status').eq('session_id', sessionId);
-    
+
+    const { data: latestLogs } = await supabase
+      .from('attendance_logs')
+      .select('student_id')
+      .eq('session_id', sessionId);
+
     if (latestLogs) {
-      latestLogs.forEach(log => { currentLogs[log.student_id] = log.status; });
+      latestLogs.forEach(log => {
+        currentLogs[log.student_id] = 'PRESENT';
+      });
     }
 
-    const missingStudents = rosterList.filter(s => !currentLogs[s.student_id] || currentLogs[s.student_id] === 'NOT SCANNED');
+    const missingStudents = rosterList.filter(s => !currentLogs[s.student_id]);
 
     if (missingStudents.length > 0) {
       const absentRecords = missingStudents.map(s => ({
-        session_id: sessionId, student_id: s.student_id, status: 'ABSENT'
+        session_id: sessionId,
+        student_id: s.student_id,
+        status: 'ABSENT'
       }));
+
       await supabase.from('attendance_logs').insert(absentRecords);
     }
 
@@ -272,7 +334,9 @@ export default function TeacherDashboard() {
       .eq('id', sessionId)
       .select().single();
 
-    if (closedSession) setPastSessions(prev => [closedSession, ...prev]);
+    if (closedSession) {
+      setPastSessions(prev => [closedSession, ...prev]);
+    }
 
     setActiveSession(null);
     setCurrentQrPayload('SESSION_INACTIVE');
@@ -289,11 +353,22 @@ export default function TeacherDashboard() {
       const lateThreshold = parseTimeToISO(scheduling.lateTime);
       const endTime = parseTimeToISO(scheduling.endTime);
 
-      if (new Date(lateThreshold) <= new Date(startTime)) return alert("Late threshold must occur after the start time.");
-      if (new Date(endTime) <= new Date(lateThreshold)) return alert("End time must occur after the late threshold.");
+      if (new Date(lateThreshold) <= new Date(startTime)) {
+        return alert("Late threshold must occur after the start time.");
+      }
+      if (new Date(endTime) <= new Date(lateThreshold)) {
+        return alert("End time must occur after the late threshold.");
+      }
 
       const { data } = await supabase.from('attendance_sessions').insert([
-        { class_id: selectedClassId, teacher_id: teacherContext.id, start_time: startTime, late_threshold: lateThreshold, end_time: endTime, is_active: true }
+        { 
+          class_id: selectedClassId, 
+          teacher_id: teacherContext.id, 
+          start_time: startTime,
+          late_threshold: lateThreshold, 
+          end_time: endTime,
+          is_active: true 
+        }
       ]).select().single();
 
       if (data) {
@@ -311,9 +386,15 @@ export default function TeacherDashboard() {
     const autoEndCheck = setInterval(() => {
       const current = activeSessionRef.current;
       if (current && current.end_time) {
-        if (new Date() >= new Date(current.end_time)) closeActiveSession(current.id, enrolledStudentsRef.current);
+        const now = new Date();
+        const scheduledEnd = new Date(current.end_time);
+        
+        if (now >= scheduledEnd) {
+          closeActiveSession(current.id, enrolledStudentsRef.current);
+        }
       }
     }, 1000);
+
     return () => clearInterval(autoEndCheck);
   }, [closeActiveSession]);
 
@@ -347,24 +428,45 @@ export default function TeacherDashboard() {
     return () => supabase.removeChannel(channel);
   }, [activeSession]);
 
-  // 6. PDF Export
+  // 5. PDF Export Generation
   const exportSessionPDF = async (session) => {
-    const { data: logs } = await supabase.from('attendance_logs').select('status, students(student_id_number, users(first_name, last_name))').eq('session_id', session.id);
+    const { data: logs } = await supabase
+      .from('attendance_logs')
+      .select('status, students(student_id_number, users(first_name, last_name))')
+      .eq('session_id', session.id);
+
     if (!logs) return alert("Failed to fetch logs for PDF.");
 
     const doc = new jsPDF();
     const classDetails = myClasses.find(c => c.id === session.class_id);
     const dateStr = new Date(session.start_time).toLocaleDateString();
     
-    doc.setFontSize(18); doc.text(`Attendance Report`, 14, 20);
-    doc.setFontSize(12); doc.text(`Class: ${classDetails.subjects.code} - ${classDetails.section_name}`, 14, 30);
+    doc.setFontSize(18);
+    doc.text(`Attendance Report`, 14, 20);
+    
+    doc.setFontSize(12);
+    doc.text(`Class: ${classDetails.subjects.code} - ${classDetails.section_name}`, 14, 30);
     doc.text(`Date: ${dateStr}`, 14, 37);
     doc.text(`Started: ${new Date(session.start_time).toLocaleTimeString()}`, 14, 44);
     doc.text(`Late After: ${new Date(session.late_threshold).toLocaleTimeString()}`, 14, 51);
-    if (session.end_time) doc.text(`Session Concluded: ${new Date(session.end_time).toLocaleTimeString()}`, 14, 58);
+    if (session.end_time) {
+      doc.text(`Session Concluded: ${new Date(session.end_time).toLocaleTimeString()}`, 14, 58);
+    }
 
-    const tableData = logs.map(log => [`${log.students.users.first_name} ${log.students.users.last_name}`, log.students.student_id_number, log.status]);
-    autoTable(doc, { startY: 68, head: [['Student Name', 'Student ID', 'Status']], body: tableData, theme: 'grid', headStyles: { fillColor: [37, 99, 235] } });
+    const tableData = logs.map(log => [
+      `${log.students.users.first_name} ${log.students.users.last_name}`,
+      log.students.student_id_number,
+      log.status
+    ]);
+
+    autoTable(doc, {
+      startY: 68,
+      head: [['Student Name', 'Student ID', 'Status']],
+      body: tableData,
+      theme: 'grid',
+      headStyles: { fillColor: [37, 99, 235] }
+    });
+
     doc.save(`Attendance_${classDetails.subjects.code}_${dateStr.replace(/\//g, '-')}.pdf`);
   };
 
@@ -376,7 +478,10 @@ export default function TeacherDashboard() {
     <div className="flex flex-col gap-6">
       
       <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex justify-between items-center">
-        <div><h1 className="text-xl font-bold text-gray-800">Teacher Dashboard</h1><p className="text-sm text-gray-500">Manage your classes and attendance</p></div>
+        <div>
+          <h1 className="text-xl font-bold text-gray-800">Teacher Dashboard</h1>
+          <p className="text-sm text-gray-500">Manage your classes and attendance</p>
+        </div>
         <div className="flex items-center gap-3">
           <label className="text-sm font-semibold text-gray-700">Active Class:</label>
           <select value={selectedClassId} onChange={(e) => setSelectedClassId(e.target.value)} disabled={activeSession !== null} className="px-4 py-2 border border-gray-300 rounded-lg bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50">
@@ -438,7 +543,7 @@ export default function TeacherDashboard() {
                 </div>
 
                 <div className="mt-8 flex gap-4 w-full max-w-md">
-                  {!activeSession ? <button onClick={toggleSession} className="flex-1 py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 shadow-md">Start Attendance Session</button> : <button onClick={toggleSession} className="flex-1 py-3 bg-red-50 text-red-600 border border-red-200 rounded-lg font-bold hover:bg-red-100 shadow-md">End Session & Log Absences</button>}
+                  {!activeSession ? <button onClick={toggleSession} className="flex-1 py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 transition shadow-md">Start Attendance Session</button> : <button onClick={toggleSession} className="flex-1 py-3 bg-red-50 text-red-600 border border-red-200 rounded-lg font-bold hover:bg-red-100 transition shadow-md">End Session & Log Absences</button>}
                 </div>
               </>
             ) : <div className="text-gray-500 font-medium">Please create and select a class to start a session.</div>}
@@ -512,6 +617,9 @@ export default function TeacherDashboard() {
                     if (status === 'LATE') statusColor = 'text-yellow-700 bg-yellow-50 border-yellow-200 font-bold';
                     if (status === 'ABSENT') statusColor = 'text-red-700 bg-red-50 border-red-200 font-bold';
 
+                    // Verify device linkage presence (PostgREST array length logic)
+                    const isPhoneLinked = student.users.devices && student.users.devices.length > 0;
+
                     return (
                       <tr key={enrollment.student_id} className="hover:bg-gray-50">
                         <td className="p-4 text-gray-800 font-medium">{student.users.first_name} {student.users.last_name}</td>
@@ -533,9 +641,11 @@ export default function TeacherDashboard() {
                           )}
                         </td>
                         <td className="p-4 text-right space-x-4">
-                          <button onClick={() => handleUnlinkDevice(student.user_id, student.users.first_name)} className="text-orange-500 hover:text-orange-700 text-sm font-semibold transition">
-                            Unlink Phone
-                          </button>
+                          {isPhoneLinked && (
+                            <button onClick={() => handleUnlinkDevice(student.user_id, student.users.first_name)} className="text-orange-500 hover:text-orange-700 text-sm font-semibold transition">
+                              Unlink Phone
+                            </button>
+                          )}
                           <button onClick={() => handleRemoveStudent(enrollment.id, student.users.first_name)} className="text-red-500 hover:text-red-700 text-sm font-semibold transition">
                             Remove
                           </button>
