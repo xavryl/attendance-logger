@@ -3,11 +3,9 @@ import { Scanner } from '@yudiel/react-qr-scanner';
 import { supabase } from '../../lib/supabase';
 
 export default function StudentPortal() {
-  // 1. Hardware Binding: Get or Create the secret device token
   const getDeviceToken = () => {
     let token = localStorage.getItem('secure_device_token');
     if (!token) {
-      // Create a unique identifier for this specific phone/browser
       token = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2) + Date.now().toString(36);
       localStorage.setItem('secure_device_token', token);
     }
@@ -34,7 +32,6 @@ export default function StudentPortal() {
     try {
       const deviceToken = getDeviceToken();
 
-      // Step 1: Find the student in the database
       const { data: studentData, error: studentError } = await supabase
         .from('students')
         .select('id, user_id, users(first_name, last_name)')
@@ -47,7 +44,6 @@ export default function StudentPortal() {
         return;
       }
 
-      // Step 2: Hardware Security Check
       const { data: deviceData } = await supabase
         .from('devices')
         .select('*')
@@ -55,20 +51,15 @@ export default function StudentPortal() {
         .maybeSingle();
 
       if (deviceData) {
-        // A device is already registered to this student. Does it match this phone?
         if (deviceData.device_fingerprint !== deviceToken) {
-          setLoginError('SECURITY ALERT: This Student ID is locked to another device. If you got a new phone, ask your teacher to reset your pairing.');
+          setLoginError('SECURITY ALERT: This Student ID is locked to another device.');
           setIsLoggingIn(false);
           return;
         }
       } else {
-        // First time logging in! Lock this phone to the database.
         const { error: insertDeviceError } = await supabase
           .from('devices')
-          .insert({
-            user_id: studentData.user_id,
-            device_fingerprint: deviceToken
-          });
+          .insert({ user_id: studentData.user_id, device_fingerprint: deviceToken });
 
         if (insertDeviceError) {
           setLoginError('Failed to securely bind device to database.');
@@ -77,7 +68,6 @@ export default function StudentPortal() {
         }
       }
 
-      // Step 3: Success! Save context and reveal scanner
       const context = {
         id: studentData.id,
         firstName: studentData.users.first_name,
@@ -120,6 +110,24 @@ export default function StudentPortal() {
 
       if (now < sessionStart) throw new Error('This session has not started yet.');
       if (now > sessionEnd) throw new Error('This session has concluded.');
+
+      // --- SECURITY PATCH: Just-In-Time Enrollment Verification ---
+      // We must prove the student is currently enrolled in the class tied to this QR code.
+      const { data: enrollmentData, error: enrollmentError } = await supabase
+        .from('enrollments')
+        .select('id')
+        .eq('student_id', studentContext.id)
+        .eq('class_id', tokenData.session.class_id)
+        .maybeSingle();
+
+      if (!enrollmentData || enrollmentError) {
+        // Self-Destruct the local session
+        localStorage.removeItem('student_context');
+        localStorage.removeItem('secure_device_token'); // Forces a completely new hardware bind next time
+        setStudentContext(null);
+        throw new Error('ACCESS REVOKED: You are no longer enrolled in this class. You have been logged out.');
+      }
+      // -----------------------------------------------------------
 
       const finalStatus = now > lateThreshold ? 'LATE' : 'PRESENT';
 
