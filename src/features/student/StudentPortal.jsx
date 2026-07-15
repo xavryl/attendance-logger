@@ -3,7 +3,17 @@ import { Scanner } from '@yudiel/react-qr-scanner';
 import { supabase } from '../../lib/supabase';
 
 export default function StudentPortal() {
-  // Lazy initialize state directly from localStorage to persist the bound ID
+  // 1. Hardware Binding: Get or Create the secret device token
+  const getDeviceToken = () => {
+    let token = localStorage.getItem('secure_device_token');
+    if (!token) {
+      // Create a unique identifier for this specific phone/browser
+      token = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2) + Date.now().toString(36);
+      localStorage.setItem('secure_device_token', token);
+    }
+    return token;
+  };
+
   const [studentContext, setStudentContext] = useState(() => {
     const saved = localStorage.getItem('student_context');
     return saved ? JSON.parse(saved) : null;
@@ -22,28 +32,64 @@ export default function StudentPortal() {
     setIsLoggingIn(true);
 
     try {
-      const { data, error } = await supabase
+      const deviceToken = getDeviceToken();
+
+      // Step 1: Find the student in the database
+      const { data: studentData, error: studentError } = await supabase
         .from('students')
         .select('id, user_id, users(first_name, last_name)')
         .eq('student_id_number', studentIdInput.trim())
         .maybeSingle();
 
-      if (error || !data) {
+      if (studentError || !studentData) {
         setLoginError('Student ID not found. Please ask your teacher to register you.');
-      } else {
-        const context = {
-          id: data.id,
-          firstName: data.users.first_name,
-          lastName: data.users.last_name,
-          studentId: studentIdInput.trim()
-        };
-        
-        // Save context to state and permanently bind it to this browser's localStorage
-        setStudentContext(context);
-        localStorage.setItem('student_context', JSON.stringify(context));
+        setIsLoggingIn(false);
+        return;
       }
+
+      // Step 2: Hardware Security Check
+      const { data: deviceData } = await supabase
+        .from('devices')
+        .select('*')
+        .eq('user_id', studentData.user_id)
+        .maybeSingle();
+
+      if (deviceData) {
+        // A device is already registered to this student. Does it match this phone?
+        if (deviceData.device_fingerprint !== deviceToken) {
+          setLoginError('SECURITY ALERT: This Student ID is locked to another device. If you got a new phone, ask your teacher to reset your pairing.');
+          setIsLoggingIn(false);
+          return;
+        }
+      } else {
+        // First time logging in! Lock this phone to the database.
+        const { error: insertDeviceError } = await supabase
+          .from('devices')
+          .insert({
+            user_id: studentData.user_id,
+            device_fingerprint: deviceToken
+          });
+
+        if (insertDeviceError) {
+          setLoginError('Failed to securely bind device to database.');
+          setIsLoggingIn(false);
+          return;
+        }
+      }
+
+      // Step 3: Success! Save context and reveal scanner
+      const context = {
+        id: studentData.id,
+        firstName: studentData.users.first_name,
+        lastName: studentData.users.last_name,
+        studentId: studentIdInput.trim()
+      };
+      
+      setStudentContext(context);
+      localStorage.setItem('student_context', JSON.stringify(context));
+
     } catch (err) {
-      setLoginError('A database error occurred.');
+      setLoginError('A database connection error occurred.');
     } finally {
       setIsLoggingIn(false);
     }
@@ -65,32 +111,20 @@ export default function StudentPortal() {
       if (tokenError || !tokenData) throw new Error('Invalid or unrecognized QR code.');
 
       const now = new Date();
-      
-      // Enforce the 30-second token rotation window
       const tokenExpiresAt = new Date(tokenData.expires_at);
       if (now > tokenExpiresAt) throw new Error('Token expired. Please wait for the QR code to rotate.');
 
-      // Enforce the scheduled session boundaries
       const sessionStart = new Date(tokenData.session.start_time);
       const sessionEnd = new Date(tokenData.session.end_time);
       const lateThreshold = new Date(tokenData.session.late_threshold);
 
-      if (now < sessionStart) {
-        throw new Error('This session has not started yet.');
-      }
-      if (now > sessionEnd) {
-        throw new Error('This session has concluded.');
-      }
+      if (now < sessionStart) throw new Error('This session has not started yet.');
+      if (now > sessionEnd) throw new Error('This session has concluded.');
 
-      // Determine attendance status based on the exact moment of insertion
       const finalStatus = now > lateThreshold ? 'LATE' : 'PRESENT';
 
       const { error: insertError } = await supabase.from('attendance_logs').insert([
-        { 
-          session_id: tokenData.session_id, 
-          student_id: studentContext.id, 
-          status: finalStatus 
-        }
+        { session_id: tokenData.session_id, student_id: studentContext.id, status: finalStatus }
       ]);
 
       if (insertError) {
@@ -119,7 +153,6 @@ export default function StudentPortal() {
     setStatusMessage('Ready to Scan');
   };
 
-  // Render identification/registration lock screen
   if (!studentContext) {
     return (
       <div className="max-w-md mx-auto bg-white min-h-[600px] flex flex-col shadow-xl border border-gray-100 rounded-3xl overflow-hidden relative">
@@ -131,7 +164,7 @@ export default function StudentPortal() {
           <form onSubmit={handleLogin} className="w-full bg-white p-6 rounded-xl shadow-sm border border-gray-200">
             <h3 className="text-lg font-bold text-gray-800 mb-2 text-center">Enter Student ID</h3>
             <p className="text-xs text-gray-500 mb-6 text-center">
-              This browser will be locked to this student ID to prevent proxy submissions.
+              This device will be permanently locked to your ID to prevent proxy scanning.
             </p>
             <input 
               type="text" 
@@ -141,7 +174,11 @@ export default function StudentPortal() {
               className="w-full px-4 py-3 border border-gray-300 rounded-lg mb-4 focus:ring-2 focus:ring-blue-500 focus:outline-none"
               required
             />
-            {loginError && <p className="text-red-500 text-sm mb-4 text-center">{loginError}</p>}
+            {loginError && (
+              <div className="bg-red-50 border-l-4 border-red-500 p-3 mb-4 rounded">
+                <p className="text-red-700 text-xs font-semibold">{loginError}</p>
+              </div>
+            )}
             <button 
               type="submit" 
               disabled={isLoggingIn}
@@ -155,7 +192,6 @@ export default function StudentPortal() {
     );
   }
 
-  // Render scanner screen once device identity is locked in
   return (
     <div className="max-w-md mx-auto bg-white min-h-[600px] flex flex-col shadow-xl border border-gray-100 rounded-3xl overflow-hidden relative">
       <div className="bg-blue-600 text-white p-6 text-center shadow-md z-10 flex justify-between items-center">
@@ -186,19 +222,19 @@ export default function StudentPortal() {
 
           {scanStatus === 'success' && (
             <div className="absolute inset-0 bg-green-500/90 flex flex-col items-center justify-center backdrop-blur-sm transition-all duration-300 z-10">
-              <span className="text-white font-bold text-lg tracking-wide">Present</span>
+              <span className="text-white font-bold text-lg tracking-wide">Recorded</span>
             </div>
           )}
 
           {scanStatus === 'error' && (
             <div className="absolute inset-0 bg-red-500/90 flex flex-col items-center justify-center backdrop-blur-sm transition-all duration-300 z-10">
-              <span className="text-white font-bold text-lg tracking-wide">Scan Failed</span>
+              <span className="text-white font-bold text-lg tracking-wide text-center px-4">Scan Failed</span>
             </div>
           )}
 
           {scanStatus === 'duplicate' && (
             <div className="absolute inset-0 bg-yellow-500/90 flex flex-col items-center justify-center backdrop-blur-sm transition-all duration-300 z-10">
-              <span className="text-white font-bold text-lg tracking-wide text-center px-4">Already Recorded</span>
+              <span className="text-white font-bold text-lg tracking-wide text-center px-4">Already Logged</span>
             </div>
           )}
         </div>
