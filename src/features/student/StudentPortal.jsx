@@ -58,24 +58,45 @@ export default function StudentPortal() {
     try {
       const { data: tokenData, error: tokenError } = await supabase
         .from('qr_tokens')
-        .select('*')
+        .select('*, session:attendance_sessions(*)')
         .eq('payload', payload)
         .single();
 
       if (tokenError || !tokenData) throw new Error('Invalid or unrecognized QR code.');
 
       const now = new Date();
-      const expiresAt = new Date(tokenData.expires_at);
-      if (now > expiresAt) throw new Error('Token expired. Please wait for the QR code to rotate.');
+      
+      // Enforce the 30-second token rotation window
+      const tokenExpiresAt = new Date(tokenData.expires_at);
+      if (now > tokenExpiresAt) throw new Error('Token expired. Please wait for the QR code to rotate.');
+
+      // Enforce the scheduled session boundaries
+      const sessionStart = new Date(tokenData.session.start_time);
+      const sessionEnd = new Date(tokenData.session.end_time);
+      const lateThreshold = new Date(tokenData.session.late_threshold);
+
+      if (now < sessionStart) {
+        throw new Error('This session has not started yet.');
+      }
+      if (now > sessionEnd) {
+        throw new Error('This session has concluded.');
+      }
+
+      // Determine attendance status based on the exact moment of insertion
+      const finalStatus = now > lateThreshold ? 'LATE' : 'PRESENT';
 
       const { error: insertError } = await supabase.from('attendance_logs').insert([
-        { session_id: tokenData.session_id, student_id: studentContext.id, status: 'PRESENT' }
+        { 
+          session_id: tokenData.session_id, 
+          student_id: studentContext.id, 
+          status: finalStatus 
+        }
       ]);
 
       if (insertError) {
         if (insertError.code === '23505') {
           setScanStatus('duplicate');
-          setStatusMessage('You are already marked present for this session.');
+          setStatusMessage('You are already recorded.');
           setTimeout(() => resetScanner(), 4000);
           return;
         }
@@ -83,7 +104,7 @@ export default function StudentPortal() {
       }
 
       setScanStatus('success');
-      setStatusMessage('Attendance Logged Successfully!');
+      setStatusMessage(finalStatus === 'LATE' ? 'Recorded Late' : 'Recorded Present');
       setTimeout(() => resetScanner(), 4000);
 
     } catch (err) {

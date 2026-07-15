@@ -13,6 +13,8 @@
     "@supabase/supabase-js": "^2.110.5",
     "@tailwindcss/vite": "^4.3.2",
     "@yudiel/react-qr-scanner": "^2.6.0",
+    "jspdf": "^4.2.1",
+    "jspdf-autotable": "^5.0.8",
     "qrcode.react": "^4.2.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
