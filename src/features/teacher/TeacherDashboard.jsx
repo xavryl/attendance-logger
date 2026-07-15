@@ -5,7 +5,7 @@ import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 
 export default function TeacherDashboard() {
-  const [activeTab, setActiveTab] = useState('qr'); // 'qr', 'roster', 'setup', 'history'
+  const [activeTab, setActiveTab] = useState('qr');
   const [teacherContext, setTeacherContext] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
 
@@ -28,39 +28,22 @@ export default function TeacherDashboard() {
   const [attendanceLogs, setAttendanceLogs] = useState({});
   const [stats, setStats] = useState({ present: 0, late: 0, notScanned: 0, total: 0 });
 
-  // Custom session scheduling inputs
-  const [scheduling, setScheduling] = useState({
-    startTime: '',
-    lateTime: '',
-    endTime: ''
-  });
+  const [scheduling, setScheduling] = useState({ startTime: '', lateTime: '', endTime: '' });
 
-  // Use a ref to keep track of enrolled students for the auto-end timer hook
   const enrolledStudentsRef = useRef([]);
-  useEffect(() => {
-    enrolledStudentsRef.current = enrolledStudents;
-  }, [enrolledStudents]);
+  useEffect(() => { enrolledStudentsRef.current = enrolledStudents; }, [enrolledStudents]);
 
-  // Use a ref for the active session to avoid stale state in interval functions
   const activeSessionRef = useRef(null);
-  useEffect(() => {
-    activeSessionRef.current = activeSession;
-  }, [activeSession]);
+  useEffect(() => { activeSessionRef.current = activeSession; }, [activeSession]);
 
-  // Helper: Get default times for the input boxes (HH:MM format)
   const getFormattedTime = (offsetMinutes = 0) => {
     const d = new Date();
     d.setMinutes(d.getMinutes() + offsetMinutes);
     return d.toTimeString().split(' ')[0].substring(0, 5);
   };
 
-  // Populate default times on component load
   useEffect(() => {
-    setScheduling({
-      startTime: getFormattedTime(0),
-      lateTime: getFormattedTime(10), // Default late threshold: 10 minutes from now
-      endTime: getFormattedTime(30)   // Default end time: 30 minutes from now
-    });
+    setScheduling({ startTime: getFormattedTime(0), lateTime: getFormattedTime(10), endTime: getFormattedTime(30) });
   }, []);
 
   // 1. Initialize Teacher
@@ -87,14 +70,15 @@ export default function TeacherDashboard() {
     }
   };
 
-  // 2. Load Class Data (Roster, Active Session, Past Sessions)
+  // 2. Load Class Data
   useEffect(() => {
     if (!selectedClassId) return;
 
     async function loadClassData() {
+      // NOTE: We now fetch user_id so we can target the devices table for unlinking
       const { data: roster } = await supabase
         .from('enrollments')
-        .select('id, student_id, students(student_id_number, users(first_name, last_name))')
+        .select('id, student_id, students(id, user_id, student_id_number, users(first_name, last_name))')
         .eq('class_id', selectedClassId);
       
       let currentRoster = [];
@@ -103,20 +87,10 @@ export default function TeacherDashboard() {
         setEnrolledStudents(currentRoster);
       }
 
-      const { data: history } = await supabase
-        .from('attendance_sessions')
-        .select('*')
-        .eq('class_id', selectedClassId)
-        .eq('is_active', false)
-        .order('start_time', { ascending: false });
+      const { data: history } = await supabase.from('attendance_sessions').select('*').eq('class_id', selectedClassId).eq('is_active', false).order('start_time', { ascending: false });
       if (history) setPastSessions(history);
 
-      const { data: session } = await supabase
-        .from('attendance_sessions')
-        .select('*')
-        .eq('class_id', selectedClassId)
-        .eq('is_active', true)
-        .maybeSingle();
+      const { data: session } = await supabase.from('attendance_sessions').select('*').eq('class_id', selectedClassId).eq('is_active', true).maybeSingle();
 
       if (session) {
         setActiveSession(session);
@@ -142,23 +116,7 @@ export default function TeacherDashboard() {
     loadClassData();
   }, [selectedClassId]);
 
-  // 3. Class Management & Registration
-  const handleCreateSubject = async (e) => {
-    e.preventDefault();
-    setSetupMessage('Creating...');
-    const { error } = await supabase.from('subjects').insert({ name: subjectForm.name, code: subjectForm.code, teacher_id: teacherContext.id });
-    if (!error) { setSubjectForm({ name: '', code: '' }); fetchSubjectsAndClasses(teacherContext.id); setSetupMessage('Success.'); }
-    setTimeout(() => setSetupMessage(''), 3000);
-  };
-
-  const handleCreateClass = async (e) => {
-    e.preventDefault();
-    setSetupMessage('Creating...');
-    const { error } = await supabase.from('classes').insert({ subject_id: classForm.subjectId, section_name: classForm.sectionName, teacher_id: teacherContext.id });
-    if (!error) { setClassForm({ subjectId: '', sectionName: '' }); fetchSubjectsAndClasses(teacherContext.id); setSetupMessage('Success.'); }
-    setTimeout(() => setSetupMessage(''), 3000);
-  };
-
+  // 3. Roster Actions (Register, Remove, UNLINK, OVERRIDE)
   const handleRegisterStudent = async (e) => {
     e.preventDefault();
     if (!selectedClassId) return setRegStatus('Please select a class first.');
@@ -176,7 +134,7 @@ export default function TeacherDashboard() {
 
       setRegStatus('Success.');
       setRegForm({ firstName: '', lastName: '', studentId: '' });
-      const newStudent = { id: 'temp', student_id: studentData.id, students: { student_id_number: regForm.studentId, users: { first_name: regForm.firstName, last_name: regForm.lastName } } };
+      const newStudent = { id: 'temp', student_id: studentData.id, students: { id: studentData.id, user_id: userData.id, student_id_number: regForm.studentId, users: { first_name: regForm.firstName, last_name: regForm.lastName } } };
       setEnrolledStudents(prev => [...prev, newStudent]);
       setStats(prev => ({ ...prev, total: prev.total + 1, notScanned: prev.notScanned + 1 }));
     } catch (err) {
@@ -194,7 +152,77 @@ export default function TeacherDashboard() {
     }
   };
 
-  // 4. Session Controls, QR Generation & Auto-End Timer
+  // NEW: Hardware Device Unlinking
+  const handleUnlinkDevice = async (userId, studentName) => {
+    if (!window.confirm(`Are you sure you want to unlink the device for ${studentName}? This allows them to log in on a new phone.`)) return;
+    
+    const { error } = await supabase.from('devices').delete().eq('user_id', userId);
+    if (error) {
+      alert("Failed to unlink device.");
+    } else {
+      alert(`${studentName}'s device has been unlinked successfully.`);
+    }
+  };
+
+  // NEW: Manual Attendance Override
+  const handleStatusOverride = async (studentId, newStatus) => {
+    if (!activeSession) return;
+    
+    const oldStatus = attendanceLogs[studentId] || 'NOT SCANNED';
+    if (oldStatus === newStatus) return;
+
+    // 1. Optimistic UI Update for instant feedback
+    setAttendanceLogs(prev => ({ ...prev, [studentId]: newStatus }));
+    setStats(prev => {
+      const newStats = { ...prev };
+      // Remove old status from count
+      if (oldStatus === 'PRESENT') newStats.present -= 1;
+      if (oldStatus === 'LATE') newStats.late -= 1;
+      if (oldStatus === 'NOT SCANNED' || oldStatus === 'ABSENT') newStats.notScanned -= 1;
+      
+      // Add new status to count
+      if (newStatus === 'PRESENT') newStats.present += 1;
+      if (newStatus === 'LATE') newStats.late += 1;
+      if (newStatus === 'NOT SCANNED' || newStatus === 'ABSENT') newStats.notScanned += 1;
+      return newStats;
+    });
+
+    // 2. Database Upsert (Insert or Update if exists)
+    if (newStatus === 'NOT SCANNED') {
+      // If they revert to Not Scanned, we delete the log entirely to reset it
+      await supabase.from('attendance_logs')
+        .delete()
+        .eq('session_id', activeSession.id)
+        .eq('student_id', studentId);
+    } else {
+      // Otherwise we upsert the override status
+      await supabase.from('attendance_logs').upsert({
+        session_id: activeSession.id,
+        student_id: studentId,
+        status: newStatus,
+        is_manual_override: true
+      }, { onConflict: 'session_id,student_id' });
+    }
+  };
+
+  // 4. Class Setup Forms
+  const handleCreateSubject = async (e) => {
+    e.preventDefault();
+    setSetupMessage('Creating...');
+    const { error } = await supabase.from('subjects').insert({ name: subjectForm.name, code: subjectForm.code, teacher_id: teacherContext.id });
+    if (!error) { setSubjectForm({ name: '', code: '' }); fetchSubjectsAndClasses(teacherContext.id); setSetupMessage('Success.'); }
+    setTimeout(() => setSetupMessage(''), 3000);
+  };
+
+  const handleCreateClass = async (e) => {
+    e.preventDefault();
+    setSetupMessage('Creating...');
+    const { error } = await supabase.from('classes').insert({ subject_id: classForm.subjectId, section_name: classForm.sectionName, teacher_id: teacherContext.id });
+    if (!error) { setClassForm({ subjectId: '', sectionName: '' }); fetchSubjectsAndClasses(teacherContext.id); setSetupMessage('Success.'); }
+    setTimeout(() => setSetupMessage(''), 3000);
+  };
+
+  // 5. Session Controls & Timers
   const generateAndSaveToken = useCallback(async (sessionId) => {
     const timestamp = Date.now();
     const nonce = Math.random().toString(36).substring(2, 10);
@@ -211,7 +239,6 @@ export default function TeacherDashboard() {
     }
   }, []);
 
-  // Helper to parse HH:MM input into standard UTC ISO timestamp
   const parseTimeToISO = (timeString) => {
     if (!timeString) return null;
     const [hours, minutes] = timeString.split(':');
@@ -223,45 +250,29 @@ export default function TeacherDashboard() {
     return d.toISOString();
   };
 
-  // Reusable core function to cleanly close a session and write absences
   const closeActiveSession = useCallback(async (sessionId, rosterList) => {
     const currentLogs = { ...attendanceLogs };
-
-    // Fetch up-to-date logs right before concluding to avoid race conditions
-    const { data: latestLogs } = await supabase
-      .from('attendance_logs')
-      .select('student_id')
-      .eq('session_id', sessionId);
-
+    const { data: latestLogs } = await supabase.from('attendance_logs').select('student_id, status').eq('session_id', sessionId);
+    
     if (latestLogs) {
-      latestLogs.forEach(log => {
-        currentLogs[log.student_id] = 'PRESENT';
-      });
+      latestLogs.forEach(log => { currentLogs[log.student_id] = log.status; });
     }
 
-    // Identify which students are still categorized as "Not Scanned"
-    const missingStudents = rosterList.filter(s => !currentLogs[s.student_id]);
+    const missingStudents = rosterList.filter(s => !currentLogs[s.student_id] || currentLogs[s.student_id] === 'NOT SCANNED');
 
     if (missingStudents.length > 0) {
       const absentRecords = missingStudents.map(s => ({
-        session_id: sessionId,
-        student_id: s.student_id,
-        status: 'ABSENT'
+        session_id: sessionId, student_id: s.student_id, status: 'ABSENT'
       }));
-
-      // Mass insert "ABSENT" status records for outstanding students
       await supabase.from('attendance_logs').insert(absentRecords);
     }
 
-    // Mark the session row as inactive in PostgreSQL
     const { data: closedSession } = await supabase.from('attendance_sessions')
       .update({ is_active: false, end_time: new Date().toISOString() })
       .eq('id', sessionId)
       .select().single();
 
-    if (closedSession) {
-      setPastSessions(prev => [closedSession, ...prev]);
-    }
+    if (closedSession) setPastSessions(prev => [closedSession, ...prev]);
 
     setActiveSession(null);
     setCurrentQrPayload('SESSION_INACTIVE');
@@ -274,27 +285,15 @@ export default function TeacherDashboard() {
     if (!selectedClassId) return alert("Select a class first.");
 
     if (!activeSession) {
-      // Parse dates from inputs
       const startTime = parseTimeToISO(scheduling.startTime);
       const lateThreshold = parseTimeToISO(scheduling.lateTime);
       const endTime = parseTimeToISO(scheduling.endTime);
 
-      if (new Date(lateThreshold) <= new Date(startTime)) {
-        return alert("Late threshold must occur after the start time.");
-      }
-      if (new Date(endTime) <= new Date(lateThreshold)) {
-        return alert("End time must occur after the late threshold.");
-      }
+      if (new Date(lateThreshold) <= new Date(startTime)) return alert("Late threshold must occur after the start time.");
+      if (new Date(endTime) <= new Date(lateThreshold)) return alert("End time must occur after the late threshold.");
 
       const { data } = await supabase.from('attendance_sessions').insert([
-        { 
-          class_id: selectedClassId, 
-          teacher_id: teacherContext.id, 
-          start_time: startTime,
-          late_threshold: lateThreshold, 
-          end_time: endTime,
-          is_active: true 
-        }
+        { class_id: selectedClassId, teacher_id: teacherContext.id, start_time: startTime, late_threshold: lateThreshold, end_time: endTime, is_active: true }
       ]).select().single();
 
       if (data) {
@@ -308,21 +307,13 @@ export default function TeacherDashboard() {
     }
   };
 
-  // Check every second if scheduled session end time has arrived
   useEffect(() => {
     const autoEndCheck = setInterval(() => {
       const current = activeSessionRef.current;
       if (current && current.end_time) {
-        const now = new Date();
-        const scheduledEnd = new Date(current.end_time);
-        
-        if (now >= scheduledEnd) {
-          console.log("Scheduled session end time reached. Processing automated close.");
-          closeActiveSession(current.id, enrolledStudentsRef.current);
-        }
+        if (new Date() >= new Date(current.end_time)) closeActiveSession(current.id, enrolledStudentsRef.current);
       }
     }, 1000);
-
     return () => clearInterval(autoEndCheck);
   }, [closeActiveSession]);
 
@@ -356,45 +347,24 @@ export default function TeacherDashboard() {
     return () => supabase.removeChannel(channel);
   }, [activeSession]);
 
-  // 5. PDF Export Generation
+  // 6. PDF Export
   const exportSessionPDF = async (session) => {
-    const { data: logs } = await supabase
-      .from('attendance_logs')
-      .select('status, students(student_id_number, users(first_name, last_name))')
-      .eq('session_id', session.id);
-
+    const { data: logs } = await supabase.from('attendance_logs').select('status, students(student_id_number, users(first_name, last_name))').eq('session_id', session.id);
     if (!logs) return alert("Failed to fetch logs for PDF.");
 
     const doc = new jsPDF();
     const classDetails = myClasses.find(c => c.id === session.class_id);
     const dateStr = new Date(session.start_time).toLocaleDateString();
     
-    doc.setFontSize(18);
-    doc.text(`Attendance Report`, 14, 20);
-    
-    doc.setFontSize(12);
-    doc.text(`Class: ${classDetails.subjects.code} - ${classDetails.section_name}`, 14, 30);
+    doc.setFontSize(18); doc.text(`Attendance Report`, 14, 20);
+    doc.setFontSize(12); doc.text(`Class: ${classDetails.subjects.code} - ${classDetails.section_name}`, 14, 30);
     doc.text(`Date: ${dateStr}`, 14, 37);
     doc.text(`Started: ${new Date(session.start_time).toLocaleTimeString()}`, 14, 44);
     doc.text(`Late After: ${new Date(session.late_threshold).toLocaleTimeString()}`, 14, 51);
-    if (session.end_time) {
-      doc.text(`Session Concluded: ${new Date(session.end_time).toLocaleTimeString()}`, 14, 58);
-    }
+    if (session.end_time) doc.text(`Session Concluded: ${new Date(session.end_time).toLocaleTimeString()}`, 14, 58);
 
-    const tableData = logs.map(log => [
-      `${log.students.users.first_name} ${log.students.users.last_name}`,
-      log.students.student_id_number,
-      log.status
-    ]);
-
-    autoTable(doc, {
-      startY: 68,
-      head: [['Student Name', 'Student ID', 'Status']],
-      body: tableData,
-      theme: 'grid',
-      headStyles: { fillColor: [37, 99, 235] }
-    });
-
+    const tableData = logs.map(log => [`${log.students.users.first_name} ${log.students.users.last_name}`, log.students.student_id_number, log.status]);
+    autoTable(doc, { startY: 68, head: [['Student Name', 'Student ID', 'Status']], body: tableData, theme: 'grid', headStyles: { fillColor: [37, 99, 235] } });
     doc.save(`Attendance_${classDetails.subjects.code}_${dateStr.replace(/\//g, '-')}.pdf`);
   };
 
@@ -406,10 +376,7 @@ export default function TeacherDashboard() {
     <div className="flex flex-col gap-6">
       
       <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex justify-between items-center">
-        <div>
-          <h1 className="text-xl font-bold text-gray-800">Teacher Dashboard</h1>
-          <p className="text-sm text-gray-500">Manage your classes and attendance</p>
-        </div>
+        <div><h1 className="text-xl font-bold text-gray-800">Teacher Dashboard</h1><p className="text-sm text-gray-500">Manage your classes and attendance</p></div>
         <div className="flex items-center gap-3">
           <label className="text-sm font-semibold text-gray-700">Active Class:</label>
           <select value={selectedClassId} onChange={(e) => setSelectedClassId(e.target.value)} disabled={activeSession !== null} className="px-4 py-2 border border-gray-300 rounded-lg bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50">
@@ -421,9 +388,8 @@ export default function TeacherDashboard() {
 
       <div className="flex border-b border-gray-200">
         <button onClick={() => setActiveTab('qr')} className={`px-6 py-3 font-semibold ${activeTab === 'qr' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:bg-gray-50'}`}>Live Scanner</button>
-        <button onClick={() => setActiveTab('roster')} className={`px-6 py-3 font-semibold ${activeTab === 'roster' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:bg-gray-50'}`}>Roster</button>
+        <button onClick={() => setActiveTab('roster')} className={`px-6 py-3 font-semibold ${activeTab === 'roster' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:bg-gray-50'}`}>Roster & Setup</button>
         <button onClick={() => setActiveTab('history')} className={`px-6 py-3 font-semibold ${activeTab === 'history' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:bg-gray-50'}`}>Session History</button>
-        <button onClick={() => setActiveTab('setup')} className={`px-6 py-3 font-semibold ${activeTab === 'setup' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:bg-gray-50'}`}>Class Management</button>
       </div>
 
       {/* TAB 1: LIVE QR */}
@@ -450,23 +416,13 @@ export default function TeacherDashboard() {
                   </span>
                 </div>
 
-                {/* Scheduling Parameters Inputs (Visible only when standby) */}
                 {!activeSession && (
                   <div className="w-full max-w-md bg-gray-50 p-4 rounded-xl border border-gray-200 mb-8 space-y-3">
                     <h4 className="text-sm font-bold text-gray-700">Schedule Session Times</h4>
                     <div className="grid grid-cols-3 gap-3">
-                      <div>
-                        <label className="block text-xs font-semibold text-gray-500 mb-1">Start Time</label>
-                        <input type="time" value={scheduling.startTime} onChange={e => setScheduling({...scheduling, startTime: e.target.value})} className="w-full px-2 py-1 text-sm border rounded bg-white" />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-semibold text-gray-500 mb-1">Late After</label>
-                        <input type="time" value={scheduling.lateTime} onChange={e => setScheduling({...scheduling, lateTime: e.target.value})} className="w-full px-2 py-1 text-sm border rounded bg-white" />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-semibold text-gray-500 mb-1">Auto End</label>
-                        <input type="time" value={scheduling.endTime} onChange={e => setScheduling({...scheduling, endTime: e.target.value})} className="w-full px-2 py-1 text-sm border rounded bg-white" />
-                      </div>
+                      <div><label className="block text-xs font-semibold text-gray-500 mb-1">Start Time</label><input type="time" value={scheduling.startTime} onChange={e => setScheduling({...scheduling, startTime: e.target.value})} className="w-full px-2 py-1 text-sm border rounded bg-white" /></div>
+                      <div><label className="block text-xs font-semibold text-gray-500 mb-1">Late After</label><input type="time" value={scheduling.lateTime} onChange={e => setScheduling({...scheduling, lateTime: e.target.value})} className="w-full px-2 py-1 text-sm border rounded bg-white" /></div>
+                      <div><label className="block text-xs font-semibold text-gray-500 mb-1">Auto End</label><input type="time" value={scheduling.endTime} onChange={e => setScheduling({...scheduling, endTime: e.target.value})} className="w-full px-2 py-1 text-sm border rounded bg-white" /></div>
                     </div>
                   </div>
                 )}
@@ -474,58 +430,30 @@ export default function TeacherDashboard() {
                 <div className={`w-80 h-80 border-4 flex flex-col items-center justify-center rounded-xl transition-all duration-300 ${activeSession ? 'border-blue-500 bg-white shadow-[0_0_30px_rgba(59,130,246,0.15)]' : 'border-dashed border-gray-300 bg-gray-50'}`}>
                   {activeSession ? (
                     <div className="flex flex-col items-center justify-center">
-                      <div className="p-4 bg-white rounded-xl shadow-sm border border-gray-100 mb-4">
-                        <QRCodeSVG value={currentQrPayload} size={200} level="H" includeMargin={false} />
-                      </div>
+                      <div className="p-4 bg-white rounded-xl shadow-sm border border-gray-100 mb-4"><QRCodeSVG value={currentQrPayload} size={200} level="H" includeMargin={false} /></div>
                       <div className="text-3xl font-bold text-blue-600 tabular-nums">{countdown}s</div>
                       <p className="text-xs text-gray-500 mt-1 uppercase tracking-wider font-semibold">Until Rotation</p>
                     </div>
-                  ) : (
-                    <span className="text-gray-400 font-medium">Configure times & start session</span>
-                  )}
+                  ) : <span className="text-gray-400 font-medium">Configure times & start session</span>}
                 </div>
 
                 <div className="mt-8 flex gap-4 w-full max-w-md">
-                  {!activeSession ? (
-                    <button onClick={toggleSession} className="flex-1 py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 transition shadow-md">
-                      Start Attendance Session
-                    </button>
-                  ) : (
-                    <button onClick={toggleSession} className="flex-1 py-3 bg-red-50 text-red-600 border border-red-200 rounded-lg font-bold hover:bg-red-100 transition shadow-md">
-                      End Session & Log Absences
-                    </button>
-                  )}
+                  {!activeSession ? <button onClick={toggleSession} className="flex-1 py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 shadow-md">Start Attendance Session</button> : <button onClick={toggleSession} className="flex-1 py-3 bg-red-50 text-red-600 border border-red-200 rounded-lg font-bold hover:bg-red-100 shadow-md">End Session & Log Absences</button>}
                 </div>
               </>
-            ) : (
-              <div className="text-gray-500 font-medium">Please create and select a class to start a session.</div>
-            )}
+            ) : <div className="text-gray-500 font-medium">Please create and select a class to start a session.</div>}
           </div>
 
           <div className="flex flex-col gap-6">
             <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
               <h3 className="text-lg font-bold mb-4 text-gray-800 border-b pb-2">Live Roster Status</h3>
               <div className="space-y-3">
-                <div className="flex justify-between items-center p-3 bg-green-50 text-green-700 rounded-lg border border-green-100">
-                  <span className="font-semibold">Present</span>
-                  <span className="font-bold text-2xl">{stats.present}</span>
-                </div>
-                <div className="flex justify-between items-center p-3 bg-yellow-50 text-yellow-700 rounded-lg border border-yellow-100">
-                  <span className="font-semibold">Late</span>
-                  <span className="font-bold text-2xl">{stats.late}</span>
-                </div>
-                <div className="flex justify-between items-center p-3 bg-gray-50 text-gray-600 rounded-lg border border-gray-200">
-                  <span className="font-semibold">Not Scanned</span>
-                  <span className="font-bold text-2xl">{stats.notScanned}</span>
-                </div>
+                <div className="flex justify-between items-center p-3 bg-green-50 text-green-700 rounded-lg border border-green-100"><span className="font-semibold">Present</span><span className="font-bold text-2xl">{stats.present}</span></div>
+                <div className="flex justify-between items-center p-3 bg-yellow-50 text-yellow-700 rounded-lg border border-yellow-100"><span className="font-semibold">Late</span><span className="font-bold text-2xl">{stats.late}</span></div>
+                <div className="flex justify-between items-center p-3 bg-gray-50 text-gray-600 rounded-lg border border-gray-200"><span className="font-semibold">Not Scanned</span><span className="font-bold text-2xl">{stats.notScanned}</span></div>
                 <div className="mt-4 pt-4 border-t">
-                  <div className="flex justify-between text-xs text-gray-500 mb-1">
-                    <span>Scan Completion</span>
-                    <span>{stats.total > 0 ? Math.round(((stats.present + stats.late) / stats.total) * 100) : 0}%</span>
-                  </div>
-                  <div className="w-full bg-gray-200 rounded-full h-2">
-                    <div className="bg-blue-600 h-2 rounded-full transition-all duration-500" style={{ width: `${stats.total > 0 ? ((stats.present + stats.late) / stats.total) * 100 : 0}%` }}></div>
-                  </div>
+                  <div className="flex justify-between text-xs text-gray-500 mb-1"><span>Scan Completion</span><span>{stats.total > 0 ? Math.round(((stats.present + stats.late) / stats.total) * 100) : 0}%</span></div>
+                  <div className="w-full bg-gray-200 rounded-full h-2"><div className="bg-blue-600 h-2 rounded-full transition-all duration-500" style={{ width: `${stats.total > 0 ? ((stats.present + stats.late) / stats.total) * 100 : 0}%` }}></div></div>
                 </div>
               </div>
             </div>
@@ -533,32 +461,35 @@ export default function TeacherDashboard() {
         </div>
       )}
 
-      {/* TAB 2: ROSTER */}
+      {/* TAB 2: ROSTER & OVERRIDES */}
       {activeTab === 'roster' && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 animate-in fade-in duration-300">
-          <div className="col-span-1 bg-white p-6 rounded-xl shadow-sm border border-gray-100 h-fit">
-            <h3 className="text-lg font-bold mb-4 text-gray-800 border-b pb-2">Register Student to Class</h3>
-            <form onSubmit={handleRegisterStudent} className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">First Name</label>
-                <input type="text" required value={regForm.firstName} onChange={e => setRegForm({...regForm, firstName: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-md" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Last Name</label>
-                <input type="text" required value={regForm.lastName} onChange={e => setRegForm({...regForm, lastName: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-md" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Student ID</label>
-                <input type="text" required value={regForm.studentId} onChange={e => setRegForm({...regForm, studentId: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-md" />
-              </div>
-              <button type="submit" disabled={!selectedClassId} className="w-full bg-blue-600 text-white font-bold py-2 rounded-md hover:bg-blue-700 transition disabled:bg-blue-300">Add Student</button>
-              {regStatus && <p className="text-sm mt-2 text-center text-gray-600">{regStatus}</p>}
-            </form>
+          
+          <div className="col-span-1 flex flex-col gap-6">
+            <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+              <h3 className="text-lg font-bold mb-4 text-gray-800 border-b pb-2">Register Student</h3>
+              <form onSubmit={handleRegisterStudent} className="space-y-4">
+                <div><label className="block text-sm font-medium text-gray-700 mb-1">First Name</label><input type="text" required value={regForm.firstName} onChange={e => setRegForm({...regForm, firstName: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-md" /></div>
+                <div><label className="block text-sm font-medium text-gray-700 mb-1">Last Name</label><input type="text" required value={regForm.lastName} onChange={e => setRegForm({...regForm, lastName: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-md" /></div>
+                <div><label className="block text-sm font-medium text-gray-700 mb-1">Student ID</label><input type="text" required value={regForm.studentId} onChange={e => setRegForm({...regForm, studentId: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-md" /></div>
+                <button type="submit" disabled={!selectedClassId} className="w-full bg-blue-600 text-white font-bold py-2 rounded-md hover:bg-blue-700 transition disabled:bg-blue-300">Add Student</button>
+                {regStatus && <p className="text-sm mt-2 text-center text-gray-600">{regStatus}</p>}
+              </form>
+            </div>
+
+            <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+              <h3 className="text-lg font-bold mb-4 text-gray-800 border-b pb-2">Create Subject/Class</h3>
+              <form onSubmit={handleCreateClass} className="space-y-4">
+                <div><label className="block text-sm font-medium text-gray-700 mb-1">Select Subject</label><select required value={classForm.subjectId} onChange={e => setClassForm({...classForm, subjectId: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-md"><option value="" disabled>Choose a subject...</option>{mySubjects.map(sub => <option key={sub.id} value={sub.id}>{sub.code} - {sub.name}</option>)}</select></div>
+                <div><label className="block text-sm font-medium text-gray-700 mb-1">Section Name</label><input type="text" required value={classForm.sectionName} onChange={e => setClassForm({...classForm, sectionName: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-md" /></div>
+                <button type="submit" disabled={mySubjects.length === 0} className="w-full bg-blue-600 text-white font-bold py-2 rounded-md hover:bg-blue-700 transition disabled:bg-blue-300">Create Class</button>
+              </form>
+            </div>
           </div>
 
           <div className="col-span-2 bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
             <div className="p-6 border-b border-gray-100 flex justify-between items-center">
-              <h3 className="text-lg font-bold text-gray-800">Class Roster</h3>
+              <h3 className="text-lg font-bold text-gray-800">Class Roster & Manual Overrides</h3>
               <span className="text-sm text-gray-500">Total Enrolled: {enrolledStudents.length}</span>
             </div>
             <div className="overflow-x-auto">
@@ -576,16 +507,35 @@ export default function TeacherDashboard() {
                     const student = enrollment.students;
                     const status = activeSession ? (attendanceLogs[enrollment.student_id] || 'NOT SCANNED') : 'STANDBY';
                     
-                    let statusColor = 'text-gray-500 bg-gray-50';
-                    if (status === 'PRESENT') statusColor = 'text-green-700 bg-green-50 font-bold';
-                    if (status === 'LATE') statusColor = 'text-yellow-700 bg-yellow-50 font-bold';
+                    let statusColor = 'text-gray-500 bg-gray-50 border-gray-200';
+                    if (status === 'PRESENT') statusColor = 'text-green-700 bg-green-50 border-green-200 font-bold';
+                    if (status === 'LATE') statusColor = 'text-yellow-700 bg-yellow-50 border-yellow-200 font-bold';
+                    if (status === 'ABSENT') statusColor = 'text-red-700 bg-red-50 border-red-200 font-bold';
 
                     return (
                       <tr key={enrollment.student_id} className="hover:bg-gray-50">
                         <td className="p-4 text-gray-800 font-medium">{student.users.first_name} {student.users.last_name}</td>
                         <td className="p-4 text-gray-500 text-sm">{student.student_id_number}</td>
-                        <td className="p-4"><span className={`px-3 py-1 rounded-full text-xs tracking-wide ${statusColor}`}>{status}</span></td>
-                        <td className="p-4 text-right">
+                        <td className="p-4">
+                          {activeSession ? (
+                            <select 
+                              value={status} 
+                              onChange={(e) => handleStatusOverride(enrollment.student_id, e.target.value)}
+                              className={`px-3 py-1 rounded-full text-xs tracking-wide outline-none cursor-pointer border ${statusColor}`}
+                            >
+                              <option value="NOT SCANNED" className="bg-white text-gray-700 font-normal">NOT SCANNED</option>
+                              <option value="PRESENT" className="bg-white text-gray-700 font-normal">PRESENT</option>
+                              <option value="LATE" className="bg-white text-gray-700 font-normal">LATE</option>
+                              <option value="ABSENT" className="bg-white text-gray-700 font-normal">ABSENT</option>
+                            </select>
+                          ) : (
+                            <span className={`px-3 py-1 rounded-full text-xs tracking-wide border ${statusColor}`}>{status}</span>
+                          )}
+                        </td>
+                        <td className="p-4 text-right space-x-4">
+                          <button onClick={() => handleUnlinkDevice(student.user_id, student.users.first_name)} className="text-orange-500 hover:text-orange-700 text-sm font-semibold transition">
+                            Unlink Phone
+                          </button>
                           <button onClick={() => handleRemoveStudent(enrollment.id, student.users.first_name)} className="text-red-500 hover:text-red-700 text-sm font-semibold transition">
                             Remove
                           </button>
@@ -624,49 +574,15 @@ export default function TeacherDashboard() {
                     <td className="p-4 text-gray-500 text-sm">{new Date(session.start_time).toLocaleTimeString()}</td>
                     <td className="p-4 text-gray-500 text-sm">{session.end_time ? new Date(session.end_time).toLocaleTimeString() : 'Manual Close Required'}</td>
                     <td className="p-4 text-right">
-                      <button 
-                        onClick={() => exportSessionPDF(session)}
-                        className="bg-blue-50 text-blue-600 px-4 py-2 rounded-lg font-semibold hover:bg-blue-100 transition border border-blue-200 text-sm"
-                      >
-                        Download PDF
-                      </button>
+                      <button onClick={() => exportSessionPDF(session)} className="bg-blue-50 text-blue-600 px-4 py-2 rounded-lg font-semibold hover:bg-blue-100 transition border border-blue-200 text-sm">Download PDF</button>
                     </td>
                   </tr>
                 ))}
-                {pastSessions.length === 0 && (
-                  <tr>
-                    <td colSpan="4" className="p-8 text-center text-gray-400">No past sessions found for this class.</td>
-                  </tr>
-                )}
               </tbody>
             </table>
           </div>
         </div>
       )}
-
-      {/* TAB 4: CLASS MANAGEMENT */}
-      {activeTab === 'setup' && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 animate-in fade-in duration-300">
-          <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
-            <h3 className="text-lg font-bold mb-4 text-gray-800 border-b pb-2">1. Create a Subject</h3>
-            <form onSubmit={handleCreateSubject} className="space-y-4">
-              <div><label className="block text-sm font-medium text-gray-700 mb-1">Subject Name</label><input type="text" required value={subjectForm.name} onChange={e => setSubjectForm({...subjectForm, name: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-md" /></div>
-              <div><label className="block text-sm font-medium text-gray-700 mb-1">Subject Code</label><input type="text" required value={subjectForm.code} onChange={e => setSubjectForm({...subjectForm, code: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-md uppercase" /></div>
-              <button type="submit" className="w-full bg-indigo-600 text-white font-bold py-2 rounded-md hover:bg-indigo-700 transition">Create Subject</button>
-            </form>
-          </div>
-          <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
-            <h3 className="text-lg font-bold mb-4 text-gray-800 border-b pb-2">2. Create a Class / Section</h3>
-            <form onSubmit={handleCreateClass} className="space-y-4">
-              <div><label className="block text-sm font-medium text-gray-700 mb-1">Select Subject</label><select required value={classForm.subjectId} onChange={e => setClassForm({...classForm, subjectId: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-md"><option value="" disabled>Choose a subject...</option>{mySubjects.map(sub => <option key={sub.id} value={sub.id}>{sub.code} - {sub.name}</option>)}</select></div>
-              <div><label className="block text-sm font-medium text-gray-700 mb-1">Section Name</label><input type="text" required value={classForm.sectionName} onChange={e => setClassForm({...classForm, sectionName: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-md" /></div>
-              <button type="submit" disabled={mySubjects.length === 0} className="w-full bg-blue-600 text-white font-bold py-2 rounded-md hover:bg-blue-700 transition disabled:bg-blue-300">Create Class</button>
-            </form>
-            {setupMessage && <p className="text-sm mt-4 text-center text-gray-600 font-medium">{setupMessage}</p>}
-          </div>
-        </div>
-      )}
-
     </div>
   );
 }
