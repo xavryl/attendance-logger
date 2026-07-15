@@ -1,9 +1,14 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Scanner } from '@yudiel/react-qr-scanner';
 import { supabase } from '../../lib/supabase';
 
 export default function StudentPortal() {
-  const [studentContext, setStudentContext] = useState(null);
+  // Lazy initialize state directly from localStorage to persist the bound ID
+  const [studentContext, setStudentContext] = useState(() => {
+    const saved = localStorage.getItem('student_context');
+    return saved ? JSON.parse(saved) : null;
+  });
+
   const [studentIdInput, setStudentIdInput] = useState('');
   const [loginError, setLoginError] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
@@ -17,7 +22,6 @@ export default function StudentPortal() {
     setIsLoggingIn(true);
 
     try {
-      // Look up the student ID in the database
       const { data, error } = await supabase
         .from('students')
         .select('id, user_id, users(first_name, last_name)')
@@ -27,12 +31,16 @@ export default function StudentPortal() {
       if (error || !data) {
         setLoginError('Student ID not found. Please ask your teacher to register you.');
       } else {
-        setStudentContext({
+        const context = {
           id: data.id,
           firstName: data.users.first_name,
           lastName: data.users.last_name,
           studentId: studentIdInput.trim()
-        });
+        };
+        
+        // Save context to state and permanently bind it to this browser's localStorage
+        setStudentContext(context);
+        localStorage.setItem('student_context', JSON.stringify(context));
       }
     } catch (err) {
       setLoginError('A database error occurred.');
@@ -90,7 +98,7 @@ export default function StudentPortal() {
     setStatusMessage('Ready to Scan');
   };
 
-  // RENDER LOGIN SCREEN
+  // Render identification/registration lock screen
   if (!studentContext) {
     return (
       <div className="max-w-md mx-auto bg-white min-h-[600px] flex flex-col shadow-xl border border-gray-100 rounded-3xl overflow-hidden relative">
@@ -100,7 +108,10 @@ export default function StudentPortal() {
         </div>
         <div className="flex-1 flex flex-col items-center justify-center p-8 bg-gray-50">
           <form onSubmit={handleLogin} className="w-full bg-white p-6 rounded-xl shadow-sm border border-gray-200">
-            <h3 className="text-lg font-bold text-gray-800 mb-4 text-center">Enter Student ID</h3>
+            <h3 className="text-lg font-bold text-gray-800 mb-2 text-center">Enter Student ID</h3>
+            <p className="text-xs text-gray-500 mb-6 text-center">
+              This browser will be locked to this student ID to prevent proxy submissions.
+            </p>
             <input 
               type="text" 
               value={studentIdInput}
@@ -123,7 +134,7 @@ export default function StudentPortal() {
     );
   }
 
-  // RENDER SCANNER SCREEN
+  // Render scanner screen once device identity is locked in
   return (
     <div className="max-w-md mx-auto bg-white min-h-[600px] flex flex-col shadow-xl border border-gray-100 rounded-3xl overflow-hidden relative">
       <div className="bg-blue-600 text-white p-6 text-center shadow-md z-10 flex justify-between items-center">
@@ -131,9 +142,6 @@ export default function StudentPortal() {
           <h2 className="text-xl font-bold tracking-tight">{studentContext.firstName} {studentContext.lastName}</h2>
           <p className="text-blue-100 text-sm mt-1">{studentContext.studentId}</p>
         </div>
-        <button onClick={() => setStudentContext(null)} className="text-sm text-blue-200 hover:text-white underline">
-          Change User
-        </button>
       </div>
 
       <div className="flex-1 flex flex-col items-center justify-center p-6 bg-gray-50">
