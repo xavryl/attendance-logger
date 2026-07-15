@@ -8,7 +8,7 @@ export default function App() {
       <div className="min-h-screen bg-gray-50 text-gray-900 font-sans">
         {/* Temporary Navigation for development */}
         <nav className="bg-blue-600 text-white p-4 shadow-md flex gap-4">
-          <div className="font-bold text-xl mr-auto">Attendance Thingy</div>
+          <div className="font-bold text-xl mr-auto">ClassConnect</div>
           <Link to="/teacher" className="hover:underline">Teacher Dashboard</Link>
           <Link to="/student" className="hover:underline">Student Portal</Link>
         </nav>
